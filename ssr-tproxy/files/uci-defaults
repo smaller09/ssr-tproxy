@@ -1,0 +1,7 @@
+#!/bin/sh
+
+# crontabs
+sed -i '/ssr-tproxy/d' /etc/crontabs/root
+echo '0 0 5 * * /etc/init.d/ssr-tproxy update' >> /etc/crontabs/root
+crontab /etc/crontabs/root
+exit 0

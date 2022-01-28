@@ -1,0 +1,145 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2018-2021 honwen <https://github.com/honwen>
+
+START=99
+EXTRA_COMMANDS="update rules"
+
+NAME=ssr-tproxy
+BLOCK=""
+DATA=/etc/${NAME}
+TARGET=/var/dnsmasq.d
+
+uci_get_by_type() {
+	local ret=$(uci get $1.@$2[0].$3 2>/dev/null)
+	echo ${ret:=$4}
+}
+
+uci_bool_by_type() {
+	case "$(uci_get_by_type $1 $2 $3)" in
+	1 | on | true | yes | enabled) return 0 ;;
+	esac
+	return 1
+}
+
+start() {
+	uci_bool_by_type ${NAME} general enable || exit 0
+	echo -en "Starting : ssr-client"
+	/usr/bin/ssr-client -d -c /etc/ssr-n.json
+	echo -en "Geneareting : $NAME\n    "
+	mkdir -p ${TARGET}
+		echo -n "IPSET:gfwlist, "
+		ln -s ${DATA}/gfwlist.conf ${TARGET}/
+		ipset -X gfwlist 2>/dev/null
+		ipset -! -R <<-EOF 2>/dev/null
+			create gfwlist hash:net hashsize 128
+			flush gfwlist
+		EOF
+	echo -en "Starting : ipt2socks\n    "
+	(/usr/bin/ipt2socks -l 2000 -r -W -w) &
+
+	echo -n "CUSTOM" && {
+		echo "all-servers" >${TARGET}/misc_custom.conf
+		echo "conf-file=${DATA}/custom.conf" >>${TARGET}/misc_custom.conf
+		}
+
+	(/etc/init.d/dnsmasq restart >/dev/null 2>&1)
+	echo " ."
+	echo -en "Starting : dns2socks\n"
+	(/usr/bin/dns2socks 127.0.0.1:1080 9.9.9.9 127.0.0.1:5300 >/dev/null 2>&1) &
+	sleep 1
+	echo -en "Starting : iptables\n"
+	rules
+}
+
+cleanup() {
+	ipset -F gfwlist 2>/dev/null
+	ipset -X gfwlist 2>/dev/null
+	echo -n "Stopping $NAME"
+	rm -rf ${TARGET}/*.conf 2>/dev/null
+	kill -9 $(pgrep -f /usr/bin/dns2socks) >/dev/null 2>&1
+	kill -9 $(pgrep -f /usr/bin/ipt2socks) >/dev/null 2>&1
+	kill -9 $(pgrep -f /usr/bin/ssr-client) >/dev/null 2>&1
+	echo "Clean up IPTABLES. "
+	iptables -t mangle -F TRANS_PREROUTING
+	iptables -t mangle -F PREROUTING	
+	iptables -t mangle -X TRANS_PREROUTING
+	iptables -t mangle -F TRANS_OUTPUT
+	iptables -t mangle -F OUTPUT
+	iptables -t mangle -X TRANS_OUTPUT
+	iptables -t mangle -F TRANS_RULE
+	iptables -t mangle -X TRANS_RULE
+	iptables -t mangle -F TRANS_DIRECT
+	iptables -t mangle -X TRANS_DIRECT
+	iptables -t mangle -F TRANS_TPROXY
+	iptables -t mangle -X TRANS_TPROXY
+
+	ip rule delete from 0/0 to 0/0 table 100
+	ip route del local 0.0.0.0/0 dev lo table 100
+}
+
+stop() {
+	cleanup
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	echo " ."
+}
+
+restart() {
+	echo "Restarting $NAME... "
+	cleanup
+	sleep 1
+	start
+}
+
+update() {
+	echo "Update gfwlist"
+	/usr/bin/gfwupd -p 5300 -s gfwlist -o /etc/ssr-tproxy/gfwlist.conf
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+}
+
+rules()
+{
+ip rule add fwmark 1 lookup 100                                                                                                                
+ip route add local 0.0.0.0/0 dev lo table 100                                                                                                  
+                            
+iptables -t mangle -N TRANS_DIRECT
+iptables -t mangle -A TRANS_DIRECT -p tcp --syn -j MARK --set-mark 0x2
+iptables -t mangle -A TRANS_DIRECT -p udp -m conntrack --ctstate NEW -j MARK --set-mark 0x2
+iptables -t mangle -A TRANS_DIRECT -j CONNMARK --save-mark
+iptables -t mangle -A TRANS_DIRECT -j ACCEPT
+                                                                                                                                               
+iptables -t mangle -N TRANS_RULE
+iptables -t mangle -A TRANS_RULE -d 127.0.0.0/8 -j ACCEPT
+iptables -t mangle -A TRANS_RULE -d 192.168.0.0/16 -j ACCEPT
+iptables -t mangle -A TRANS_RULE -d 224.0.0.0/4 -j ACCEPT
+iptables -t mangle -A TRANS_RULE -d 240.0.0.0/4 -j ACCEPT
+iptables -t mangle -A TRANS_RULE -d 255.255.255.255/32 -j ACCEPT
+iptables -t mangle -A TRANS_RULE -d 10.0.0.0/8 -j ACCEPT
+iptables -t mangle -A TRANS_RULE -d 100.64.0.0/10 -j ACCEPT
+iptables -t mangle -A TRANS_RULE -d 169.254.0.0/16 -j ACCEPT
+iptables -t mangle -A TRANS_RULE -d 172.16.0.0/12 -j ACCEPT
+iptables -t mangle -A TRANS_RULE -j CONNMARK --restore-mark
+iptables -t mangle -A TRANS_RULE -m mark --mark 0x2 -j ACCEPT
+iptables -t mangle -A TRANS_RULE -m mark --mark 0x1 -j RETURN
+iptables -t mangle -A TRANS_RULE -m set ! --match-set gfwlist dst -g TRANS_DIRECT
+iptables -t mangle -A TRANS_RULE -p tcp --syn -j MARK --set-mark 0x1
+iptables -t mangle -A TRANS_RULE -p udp -m conntrack --ctstate NEW -j MARK --set-mark 0x1
+iptables -t mangle -A TRANS_RULE -j CONNMARK --save-mark
+
+iptables -t mangle -N TRANS_TPROXY
+iptables -t mangle -A TRANS_TPROXY -p udp -j TPROXY --on-port 2000 --on-ip 127.0.0.1
+iptables -t mangle -A TRANS_TPROXY -p tcp -j TPROXY --on-port 2000 --on-ip 127.0.0.1
+
+iptables -t mangle -N TRANS_PREROUTING                                                                                                         
+iptables -t mangle -A TRANS_PREROUTING -j TRANS_RULE                                                                                          
+iptables -t mangle -A TRANS_PREROUTING -j TRANS_TPROXY
+
+iptables -t mangle -A PREROUTING -i br-lan -j TRANS_PREROUTING
+iptables -t mangle -A PREROUTING -i lo -m mark --mark 0x1 -j TRANS_TPROXY
+
+iptables -t mangle -N TRANS_OUTPUT
+iptables -t mangle -A TRANS_OUTPUT -j TRANS_RULE
+
+iptables -t mangle -A OUTPUT -j TRANS_OUTPUT
+
+}
+
